@@ -36,6 +36,9 @@ type connector struct {
 	cfg             *config.Config
 	esClient        *es.Client
 	readyCh         chan struct{}
+	readyOnce       sync.Once
+	mu              sync.Mutex
+	closed          bool
 	partitionCache  sync.Map
 	metrics         []prometheus.Collector
 }
@@ -86,8 +89,7 @@ func (c *connector) Start(ctx context.Context) {
 		logger.Info("bulk process started")
 		c.bulk.StartBulk()
 
-		// Signal ready immediately since there's no CDC to wait for
-		c.readyCh <- struct{}{}
+		c.signalReady()
 
 		// Start CDC synchronously - it will execute snapshot and return
 		c.cdc.Start(ctx)
@@ -99,11 +101,15 @@ func (c *connector) Start(ctx context.Context) {
 	go func() {
 		logger.Info("waiting for connector start...")
 		if err := c.cdc.WaitUntilReady(ctx); err != nil {
-			panic(err)
+			logger.Error("connector failed to become ready", "error", err)
+			return
+		}
+		if c.isClosed() {
+			return
 		}
 		logger.Info("bulk process started")
 		c.bulk.StartBulk()
-		c.readyCh <- struct{}{}
+		c.signalReady()
 	}()
 	c.cdc.Start(ctx)
 }
@@ -118,12 +124,32 @@ func (c *connector) WaitUntilReady(ctx context.Context) error {
 }
 
 func (c *connector) Close() {
-	if !isClosed(c.readyCh) {
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
+
+	c.readyOnce.Do(func() {
 		close(c.readyCh)
-	}
+	})
 
 	c.cdc.Close()
 	c.bulk.Close()
+}
+
+func (c *connector) signalReady() {
+	if c.isClosed() {
+		return
+	}
+	select {
+	case c.readyCh <- struct{}{}:
+	default:
+	}
+}
+
+func (c *connector) isClosed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closed
 }
 
 func (c *connector) listener(ctx *replication.ListenerContext) {
@@ -246,14 +272,4 @@ func (c *connector) findParentTable(tableNamespace, tableName string) string {
 	}
 
 	return ""
-}
-
-func isClosed[T any](ch <-chan T) bool {
-	select {
-	case <-ch:
-		return true
-	default:
-	}
-
-	return false
 }
