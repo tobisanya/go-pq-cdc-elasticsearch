@@ -255,8 +255,10 @@ func (b *Bulk) flushMessages() {
 	defer b.flushLock.Unlock()
 	if len(b.batch) > 0 {
 		err := b.bulkRequest()
-		if err != nil && b.responseHandler == nil {
-			panic(err)
+		if err != nil {
+			if b.responseHandler == nil {
+				logger.Error("bulk request failed", "error", err)
+			}
 		}
 		b.batchTicker.Reset(b.batchTickerDuration)
 		for _, batch := range b.batch {
